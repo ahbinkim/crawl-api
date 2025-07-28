@@ -6,6 +6,10 @@ import math
 
 app = Flask(__name__)
 
+@app.route('/')
+def home():
+    return 'Crawl API is running!'
+
 @app.route('/search', methods=['GET'])
 def search_product():
     search_keyword = request.args.get('q', '').strip()
@@ -35,23 +39,25 @@ def search_product():
         price_digits = re.findall(r'\d+', price_raw.replace('\xa0', '').replace(',', ''))
         if price_digits:
             original_price = int(''.join(price_digits))
-            discounted_price = math.ceil(original_price * 0.9 / 100) * 100  # 100원 단위로 올림
-    
-        return jsonify({
-            'result': 'success',
-            'product_code': search_keyword,
-            'original_price': original_price,
-            'discounted_price': discounted_price,
-            'stock': {
-                'ansan': ansan_stock,
-                'jincheon': jincheon_stock,
-                'label': stock_label
+            discounted_price = math.ceil(original_price * 0.9 / 100) * 100
+
+            return jsonify({
+                'result': 'success',
+                'product_code': search_keyword,
+                'original_price': original_price,
+                'discounted_price': discounted_price,
+                'stock': {
+                    'ansan': ansan_stock,
+                    'jincheon': jincheon_stock,
+                    'label': stock_label
                 }
             })
-        return jsonify({'result': 'no_price'})
+        else:
+            return jsonify({'result': 'no_price'})
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# 아래 줄은 삭제 또는 주석 처리
+# if __name__ == '__main__':
+#     app.run(debug=True)
