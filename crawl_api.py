@@ -3,12 +3,9 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import math
+import json  # 추가
 
 app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return 'Crawl API is running!'
 
 @app.route('/search', methods=['GET'])
 def search_product():
@@ -41,19 +38,24 @@ def search_product():
             original_price = int(''.join(price_digits))
             discounted_price = math.ceil(original_price * 0.9 / 100) * 100
 
-            return jsonify({
-                'result': 'success',
-                'product_code': search_keyword,
-                'original_price': original_price,
-                'discounted_price': discounted_price,
-                'stock': {
-                    'ansan': ansan_stock,
-                    'jincheon': jincheon_stock,
-                    'label': stock_label
-                }
-            })
-        else:
-            return jsonify({'result': 'no_price'})
+        # ✅ 여기서 직접 JSON 문자열을 만들어서 반환
+        response_data = {
+            'result': 'success',
+            'product_code': search_keyword,
+            'original_price': original_price,
+            'discounted_price': discounted_price,
+            'stock': {
+                'ansan': ansan_stock,
+                'jincheon': jincheon_stock,
+                'label': stock_label
+            }
+        }
+
+        return app.response_class(
+            response=json.dumps(response_data, ensure_ascii=False),
+            status=200,
+            mimetype='application/json'
+        )
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
