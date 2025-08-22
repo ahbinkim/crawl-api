@@ -3,6 +3,17 @@ from playwright.sync_api import sync_playwright
 from decimal import Decimal, ROUND_HALF_UP
 import re, json, time
 
+# 꼭 상단에 추가
+import urllib.request
+def ping():
+    try:
+        with urllib.request.urlopen(SEARCH_URL, timeout=10) as r:
+            return r.status
+    except Exception as e:
+        return f"ERR: {e}"
+print("PING:", ping())
+
+
 BASE = "https://www.daejungchem.co.kr"
 SEARCH_URL = f"{BASE}/02_product/search/"
 HEADLESS = True
