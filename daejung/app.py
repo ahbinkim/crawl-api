@@ -3,6 +3,11 @@ from fastapi.responses import JSONResponse
 from typing import Any, List, Union
 from daejung_crawl_pw_regonly import search_minimal
 
+try:
+    from daejung_crawl_pw_regonly import ping
+except Exception:
+    ping = None
+
 app = FastAPI(title="Daejung Crawl API")
 
 @app.get("/healthz")
