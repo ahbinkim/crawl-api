@@ -1,26 +1,11 @@
-# daejung_crawl_pw_regonly.py (indices updated, with Render launch args)
-from playwright.sync_api import sync_playwright
-from decimal import Decimal, ROUND_HALF_UP
-import re, json, time
-
-# 꼭 상단에 추가
-import urllib.request
-def ping():
-    try:
-        with urllib.request.urlopen(SEARCH_URL, timeout=10) as r:
-            return r.status
-    except Exception as e:
-        return f"ERR: {e}"
-print("PING:", ping())
-
-
 BASE = "https://www.daejungchem.co.kr"
 SEARCH_URL = f"{BASE}/02_product/search/"
 HEADLESS = True
-DEFAULT_TIMEOUT = 4000
+DEFAULT_TIMEOUT = 15000
+GOTO_TIMEOUT = 25000 
 
 # Render/containers: recommended browser flags
-LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
 
 _rx_int = re.compile(r"(\d[\d,]*)")
 
@@ -101,21 +86,71 @@ def open_popup_and_get_labels(page, anchor):
     return labels
 
 def search_minimal(keyword: str):
+    from playwright.sync_api import sync_playwright
+    import time
+
+    def goto_with_retry(page, url, attempts=3):
+        last_err = None
+        for i in range(attempts):
+            try:
+                # 빠르게 연결만 확정(commit) → 다음에 필요한 요소까지 기다림
+                page.goto(url, wait_until="commit", timeout=GOTO_TIMEOUT)
+                page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+                page.wait_for_selector(
+                    "form input[type='search'], form input[type='text'], input[placeholder*='검색'], input[placeholder*='search' i]",
+                    timeout=DEFAULT_TIMEOUT
+                )
+                return
+            except Exception as e:
+                last_err = e
+                # 짧은 백오프 후 재시도
+                page.wait_for_timeout(1200 * (i + 1))
+                try:
+                    page.reload(timeout=GOTO_TIMEOUT)
+                except Exception:
+                    pass
+        raise last_err
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
-        ctx = browser.new_context()
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+            viewport={"width": 1366, "height": 900},
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+        )
+        # 헤드리스 탐지 흔적 제거(안정성↑)
+        ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+
         page = ctx.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT)
+        page.set_default_navigation_timeout(GOTO_TIMEOUT)
 
-        page.goto(SEARCH_URL, wait_until="domcontentloaded")
+        # 불필요 리소스 차단(로딩 안정화)
+        def _route(route):
+            if route.request.resource_type in {"image", "font"}:
+                return route.abort()
+            return route.continue_()
+        page.route("**/*", _route)
+
+        # 1) 검색 페이지 진입(재시도)
+        goto_with_retry(page, SEARCH_URL, attempts=3)
+
+        # 2) 검색어 입력 → 엔터
         box = find_search_input(page)
-        box.fill(""); box.type(keyword); box.press("Enter")
+        box.fill("")
+        box.type(keyword)
+        box.press("Enter")
 
+        # 3) 결과 대기(버튼 제출 보조 + 재시도)
         try:
-            page.wait_for_selector("tbody tr", timeout=3000)
+            page.wait_for_selector("tbody tr", timeout=DEFAULT_TIMEOUT)
         except Exception:
-            page.locator("form button, button[type='submit'], input[type='submit']").first.click()
-            page.wait_for_selector("tbody tr", timeout=3000)
+            btn = page.locator("form button, button[type='submit'], input[type='submit']")
+            if btn.count():
+                btn.first.click()
+            page.wait_for_selector("tbody tr", timeout=DEFAULT_TIMEOUT)
 
         rows = page.locator("tbody tr")
         n = rows.count()
@@ -137,7 +172,6 @@ def search_minimal(keyword: str):
             price = parse_int(safe_text(tds.nth(TD_IDX["price"])))
             stock_label = safe_text(tds.nth(TD_IDX["stock"]))
 
-            # 팝업에서 규제 라벨만 추출
             name_a = tds.nth(TD_IDX["name"]).locator("a")
             labels = open_popup_and_get_labels(page, name_a.first) if name_a.count() else []
 
@@ -152,6 +186,7 @@ def search_minimal(keyword: str):
 
         browser.close()
         return items
+
 
 if __name__ == "__main__":
     kw = input("🔎 대정 제품코드 또는 키워드: ").strip()
