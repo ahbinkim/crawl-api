@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 대정 검색 최소 데이터 수집 (가성비 & 속도 최적화판)
-
-- 브라우저 1회만 띄우고 재사용 (무료 플랜에서도 빠르게)
-- 이미지/폰트 차단으로 네트워크 절감
-- 첫 결과만/라벨(팝업) 포함 여부를 옵션으로 제어
-- 견고한 대기/재시도 로직
+- 브라우저 1회만 띄우고 재사용
+- 이미지/폰트 차단
+- 첫 결과만/라벨 포함 여부 옵션
+- ✅ 팝업 클릭 X → onclick의 idx 추출 후 popup URL에 직접 접속해 라벨 수집
 """
 
 from playwright.sync_api import sync_playwright
@@ -16,11 +15,9 @@ BASE = "https://www.daejungchem.co.kr"
 SEARCH_URL = f"{BASE}/02_product/search/"
 HEADLESS = True
 
-# 시간값: 너무 짧으면 타임아웃, 너무 길면 느림 → 현실적인 타협
 DEFAULT_TIMEOUT = 15000   # 요소 대기(ms)
 GOTO_TIMEOUT = 25000      # 페이지 진입(ms)
 
-# 저가형 컨테이너/무료플랜 안정화 옵션
 LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -39,12 +36,11 @@ TD_IDX = {
     "stock": 8,      # 1-based 9
 }
 
-# ---------- 브라우저 싱글톤 (가성비 핵심) ----------
+# ---------- 브라우저 싱글톤 ----------
 _play = None
 _browser = None
 
 def get_browser():
-    """컨테이너가 살아있는 동안 브라우저 1개만 재사용."""
     global _play, _browser
     if _play is None:
         _play = sync_playwright().start()
@@ -53,20 +49,16 @@ def get_browser():
     return _browser
 
 def stop_browser():
-    """FastAPI 종료 시 호출 (메모리/프로세스 정리)."""
     global _play, _browser
     try:
-        if _browser:
-            _browser.close()
+        if _browser: _browser.close()
     except Exception:
         pass
     try:
-        if _play:
-            _play.stop()
+        if _play: _play.stop()
     except Exception:
         pass
-    _browser = None
-    _play = None
+    _browser = None; _play = None
 
 # ---------- 보조 유틸 ----------
 def ping():
@@ -81,7 +73,6 @@ def parse_int(s: str):
     return int(m.group(1).replace(",", "")) if m else None
 
 def discount_round(price: int, rate: float = 0.10, unit: int = 100) -> int | None:
-    """10% 할인 후 100원 단위 반올림."""
     if price is None:
         return None
     val = Decimal(price) * Decimal(1 - rate)
@@ -105,7 +96,7 @@ def find_search_input(page):
     raise RuntimeError("검색 입력창을 찾지 못했습니다.")
 
 def extract_regulation_lines(p):
-    """팝업에서 규제정보 관련 줄만 추출(간결/가벼움)."""
+    """팝업에서 규제정보 관련 줄만 추출."""
     try:
         raw = p.inner_text("body").strip()
     except Exception:
@@ -113,36 +104,41 @@ def extract_regulation_lines(p):
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     keep_keys = ("물질", "류", "유해", "위험", "규제", "Remark", "기존물질")
     kept = [ln for ln in lines if any(k in ln for k in keep_keys)]
-    # 중복 제거
     seen, out = set(), []
     for ln in kept:
         if ln not in seen:
             out.append(ln); seen.add(ln)
     return out
 
-def open_popup_and_get_labels(page, anchor):
+# ✅ 팝업 클릭 없이, idx를 이용해 직접 팝업 URL 접속 → 라벨 추출
+def fetch_labels_by_idx(ctx, idx: str) -> list[str]:
+    url = f"{BASE}/02_product/popup/?idx={idx}"
+    page = ctx.new_page()
     try:
-        with page.expect_popup() as pop_info:
-            anchor.click()
-        pop = pop_info.value
+        page.set_default_timeout(DEFAULT_TIMEOUT)
+        page.set_default_navigation_timeout(GOTO_TIMEOUT)
+        page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT)
+        # 에러 페이지 방지
+        try:
+            body = page.inner_text("body")
+            if "죄송합니다" in body and "페이지" in body:
+                return []
+        except Exception:
+            pass
+        return extract_regulation_lines(page)
     except Exception:
         return []
-    try:
-        pop.wait_for_load_state("domcontentloaded")
-    except Exception:
-        pass
-    labels = extract_regulation_lines(pop)
-    try:
-        pop.close()
-    except Exception:
-        pass
-    return labels
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
 
-# ---------- 메인 크롤 함수 ----------
+# ---------- 메인 함수 ----------
 def search_minimal(keyword: str, first_only: bool = False, include_labels: bool = False):
-    """필수 최소 데이터만 수집 (가성비 모드)
+    """필수 최소 데이터만 수집
     - first_only: 첫 행만 반환(가장 빠름)
-    - include_labels: 필요할 때만 팝업 라벨 수집(느림)
+    - include_labels: 필요할 때만 라벨 수집(팝업 URL 직접 접속)
     """
     def goto_with_retry(page, url, attempts=3):
         last_err = None
@@ -164,7 +160,6 @@ def search_minimal(keyword: str, first_only: bool = False, include_labels: bool 
                     pass
         raise last_err
 
-    # 브라우저 재사용 → 매 요청은 컨텍스트만 생성
     browser = get_browser()
     ctx = browser.new_context(
         user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -173,14 +168,13 @@ def search_minimal(keyword: str, first_only: bool = False, include_labels: bool 
         locale="ko-KR",
         timezone_id="Asia/Seoul",
     )
-    # 헤드리스 탐지 흔적 제거
     ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
     page = ctx.new_page()
     page.set_default_timeout(DEFAULT_TIMEOUT)
     page.set_default_navigation_timeout(GOTO_TIMEOUT)
 
-    # 리소스 절감(속도↑): 이미지/폰트 차단
+    # 리소스 절감: 이미지/폰트 차단
     def _route(route):
         if route.request.resource_type in {"image", "font"}:
             return route.abort()
@@ -227,8 +221,24 @@ def search_minimal(keyword: str, first_only: bool = False, include_labels: bool 
 
         labels = []
         if include_labels and (not first_only or i == 0):
+            # ✅ 제품명 앵커의 onclick에서 idx 추출 → 직접 팝업 URL 접근
             name_a = tds.nth(TD_IDX["name"]).locator("a")
-            labels = open_popup_and_get_labels(page, name_a.first) if name_a.count() else []
+            idx = None
+            if name_a.count():
+                onclick = name_a.first.get_attribute("onclick") or ""
+                m = re.search(r"popup/\?idx=(\d+)", onclick)
+                if m:
+                    idx = m.group(1)
+                else:
+                    # 혹시 href에 직접 들어있다면 보조
+                    href = name_a.first.get_attribute("href") or ""
+                    m2 = re.search(r"popup/\?idx=(\d+)", href)
+                    if m2:
+                        idx = m2.group(1)
+            if idx:
+                labels = fetch_labels_by_idx(ctx, idx)
+            else:
+                labels = []
 
         items.append({
             "brand": "대정화금",
@@ -242,10 +252,10 @@ def search_minimal(keyword: str, first_only: bool = False, include_labels: bool 
         if first_only:
             break
 
-    ctx.close()  # 브라우저는 유지, 컨텍스트만 닫기
+    ctx.close()
     return items
 
 if __name__ == "__main__":
     kw = input("🔎 대정 제품코드 또는 키워드: ").strip()
-    data = search_minimal(kw, first_only=True)
+    data = search_minimal(kw, first_only=True, include_labels=True)
     print(json.dumps(data, ensure_ascii=False, indent=2) if data else "❌ 결과 없음")
