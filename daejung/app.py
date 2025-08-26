@@ -7,7 +7,7 @@ import time
 
 # 같은 폴더에 있다고 가정
 from daejung_crawl_pw_regonly import (
-    search_minimal, ping
+    search_minimal
 )
 
 # --- 아주 가벼운 메모리 캐시(콜드 스타트 이후 체감↑) ---
