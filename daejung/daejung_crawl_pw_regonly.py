@@ -4,18 +4,22 @@
 - 검색/테이블 파싱은 기존 로직 유지
 - 팝업: expect_popup 대신 idx 추출 후 직접 URL 접속
 - 라벨: div.control_wrap2 p.pp 텍스트만 수집
+- Render 안정화: 타임아웃 상향 + commit+selector 대기 + 리소스 차단 + 재시도
 """
 
 from playwright.sync_api import sync_playwright
 from decimal import Decimal, ROUND_HALF_UP
-import re, json, time
+import re, json, time, urllib.request
 
 BASE = "https://www.daejungchem.co.kr"
 SEARCH_URL = f"{BASE}/02_product/search/"
 HEADLESS = True
-DEFAULT_TIMEOUT = 4000
 
-# --- Launch args (변경점 반영) ---
+# Render 네트워크/콜드스타트 대비
+DEFAULT_TIMEOUT = 20000   # 요소 대기(ms)
+GOTO_TIMEOUT    = 30000   # 페이지 진입(ms)
+
+# Playwright 런치 옵션
 LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
 _rx_int = re.compile(r"(\d[\d,]*)")
@@ -31,6 +35,15 @@ TD_IDX = {
     "stock": 8,      # 1-based 9
 }
 
+# ---- health check (app.py에서 임포트 시 사용) ----
+def ping():
+    try:
+        with urllib.request.urlopen(SEARCH_URL, timeout=8) as r:
+            return r.status  # 200이면 정상
+    except Exception as e:
+        return f"ERR:{e}"
+
+# ---- helpers ----
 def parse_int(s: str):
     m = _rx_int.search(s or "")
     return int(m.group(1).replace(",", "")) if m else None
@@ -58,8 +71,8 @@ def find_search_input(page):
             return loc.first
     raise RuntimeError("검색 입력창을 찾지 못했습니다.")
 
-# --- idx 추출: //*[@id='result_list']/div[2]/form/table/tbody/tr/td[4]/a 에서 href/onclick에서 확보 ---
 def extract_idx_from_anchor(a):
+    """//*[@id='result_list']/div[2]/form/table/tbody/tr/td[4]/a 에서 href/onclick으로 idx 확보"""
     try:
         onclick = a.get_attribute("onclick") or ""
         href    = a.get_attribute("href") or ""
@@ -71,29 +84,30 @@ def extract_idx_from_anchor(a):
         return None
     return (m.group(1) or m.group(2))
 
-# --- 팝업 라벨 수집: 직접 URL 접속 + control_wrap2 > p.pp ---
 def fetch_labels_by_anchor(ctx, anchor):
+    """팝업을 새 탭으로 직접 열고 div.control_wrap2 p.pp만 수집"""
     idx = extract_idx_from_anchor(anchor)
     if not idx:
-        return []  # idx가 확실히 여기 있다 하셨으니 보통 이 케이스는 없음
+        return []
 
     url = f"{BASE}/02_product/search/popup/?idx={idx}"
     pop = ctx.new_page()
     try:
         pop.set_default_timeout(DEFAULT_TIMEOUT)
-        # 팝업 페이지에서 이미지/폰트는 차단 (속도)
+        pop.set_default_navigation_timeout(GOTO_TIMEOUT)
+
+        # 팝업에서 이미지/폰트/미디어 차단 (속도↑)
         def _route(route):
             if route.request.resource_type in {"image","font","media"}:
                 return route.abort()
             return route.continue_()
         pop.route("**/*", _route)
 
-        pop.goto(url, wait_until="domcontentloaded")
-        # div.control_wrap2 내부 p.pp가 보일 때까지 조금 기다림
+        pop.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT)
+        # 라벨 컨테이너 대기
         try:
             pop.wait_for_selector("div.control_wrap2 p.pp", timeout=DEFAULT_TIMEOUT)
         except Exception:
-            # DOM 삽입 지연 대비 한번 더
             try:
                 pop.wait_for_load_state("networkidle", timeout=1500)
             except Exception:
@@ -104,8 +118,10 @@ def fetch_labels_by_anchor(ctx, anchor):
         out = []
         for i in range(cnt):
             t = safe_text(pps.nth(i))
-            if t and t not in out:
-                out.append(re.sub(r"\s+", " ", t))
+            if t:
+                t = re.sub(r"\s+", " ", t).strip()
+                if t and t not in out:
+                    out.append(t)
         return out
     except Exception:
         return []
@@ -115,28 +131,76 @@ def fetch_labels_by_anchor(ctx, anchor):
         except Exception:
             pass
 
+def goto_with_retry(page, url, attempts=3):
+    """Render 느린 첫 진입 대비: commit 후 selector 보장 + 재시도"""
+    last_err = None
+    for i in range(attempts):
+        try:
+            page.goto(url, wait_until="commit", timeout=GOTO_TIMEOUT)
+            page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+            page.wait_for_selector(
+                "form input[type='search'], form input[type='text'], input[placeholder*='검색'], input[placeholder*='search' i]",
+                timeout=DEFAULT_TIMEOUT
+            )
+            return
+        except Exception as e:
+            last_err = e
+            page.wait_for_timeout(1500 * (i + 1))
+            try:
+                page.reload(timeout=GOTO_TIMEOUT)
+            except Exception:
+                pass
+    raise last_err
+
 def search_minimal(keyword: str, first_only: bool = True, include_labels: bool = True):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
-        ctx = browser.new_context()
+        ctx = browser.new_context(
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/123.0.0.0 Safari/537.36"),
+        )
         page = ctx.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT)
+        page.set_default_navigation_timeout(GOTO_TIMEOUT)
 
-        page.goto(SEARCH_URL, wait_until="domcontentloaded")
+        # 검색 페이지 리소스 차단 (가벼움)
+        def _route(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                return route.abort()
+            return route.continue_()
+        page.route("**/*", _route)
+
+        # 첫 진입
+        goto_with_retry(page, SEARCH_URL, attempts=3)
+
+        # 검색
         box = find_search_input(page)
         box.fill(""); box.type(keyword); box.press("Enter")
 
+        # 결과 대기
         try:
-            page.wait_for_selector("tbody tr", timeout=3000)
+            page.wait_for_selector("tbody tr", timeout=DEFAULT_TIMEOUT)
         except Exception:
             btns = page.locator("form button, button[type='submit'], input[type='submit']")
             if btns.count():
                 btns.first.click()
-            page.wait_for_selector("tbody tr", timeout=3000)
+            page.wait_for_selector("tbody tr", timeout=DEFAULT_TIMEOUT)
 
         rows = page.locator("tbody tr")
         n = rows.count()
         if n == 0:
+            # 디버그 덤프
+            ts = int(time.time())
+            try:
+                page.screenshot(path=f"daejung_debug_{ts}.png", full_page=True)
+                with open(f"daejung_debug_{ts}.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+            except Exception:
+                pass
+            browser.close()
             return []
 
         items = []
@@ -150,9 +214,10 @@ def search_minimal(keyword: str, first_only: bool = True, include_labels: bool =
             stock_label = safe_text(tds.nth(TD_IDX["stock"]))
 
             labels = []
-            name_a = tds.nth(TD_IDX["name"]).locator("a")
-            if include_labels and name_a.count():
-                labels = fetch_labels_by_anchor(ctx, name_a.first)
+            if include_labels:
+                name_a = tds.nth(TD_IDX["name"]).locator("a")
+                if name_a.count():
+                    labels = fetch_labels_by_anchor(ctx, name_a.first)
 
             items.append({
                 "brand": "대정화금",
@@ -171,5 +236,5 @@ def search_minimal(keyword: str, first_only: bool = True, include_labels: bool =
 
 if __name__ == "__main__":
     kw = input("🔎 대정 제품코드 또는 키워드(하이픈 포함): ").strip()
-    data = search_minimal(kw)
+    data = search_minimal(kw or "4214-4405", first_only=True, include_labels=True)
     print(json.dumps(data, ensure_ascii=False, indent=2) if data else "❌ 결과 없음")
