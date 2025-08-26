@@ -1,271 +1,244 @@
+
 # -*- coding: utf-8 -*-
 """
-대정 최소 데이터 수집 (Playwright 안정화판)
-- 검색/테이블 파싱은 기존 로직 유지
-- 팝업: idx 추출 후 직접 URL 접속
-- 라벨: div.control_wrap2 p.pp 텍스트 수집 (main + iframe 모두)
-- Render 환경: 타임아웃 상향, commit+selector 대기, 리소스 차단
+Daejung minimal crawler (Playwright stable, popup labels included)
+
+- Search page parse: table parse as before (CAS/Code/Name/Pack/etc.)
+- Popup labels: extract idx, then open popup URL directly
+- Label collection: from div.control_wrap2 p.pp on main and (if present) iframe
+- Render-friendly: higher timeouts, resource blocking (images/fonts/media), robust waits
+- Works headless by default; Chromium via Playwright
 """
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from decimal import Decimal, ROUND_HALF_UP
-import re, json, time, urllib.request
+from typing import Dict, List, Any, Optional, Tuple
+import re, json, time
 
 BASE = "https://www.daejungchem.co.kr"
 SEARCH_URL = f"{BASE}/02_product/search/"
 HEADLESS = True
 
-DEFAULT_TIMEOUT = 20000   # 요소 대기(ms)
-GOTO_TIMEOUT    = 30000   # 페이지 진입(ms)
+DEFAULT_TIMEOUT = 25000   # ms, selector waits
+GOTO_TIMEOUT    = 35000   # ms, page goto
 
 LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
 _rx_int = re.compile(r"(\d[\d,]*)")
+_rx_popup_idx = re.compile(r"idx=([0-9]+)")
 
 TD_IDX = {
     "cas": 1,
     "code": 2,
     "name": 3,
-    "pack": 5,
-    "price": 7,
-    "stock": 8,
+    "pack": 5
 }
 
-# ---- health check ----
-def ping():
-    try:
-        with urllib.request.urlopen(SEARCH_URL, timeout=8) as r:
-            return r.status
-    except Exception as e:
-        return f"ERR:{e}"
+def _clean(s: Any) -> str:
+    return (s or "").strip()
 
-# ---- helpers ----
-def parse_int(s: str):
+def _extract_int(s: str) -> Optional[int]:
     m = _rx_int.search(s or "")
-    return int(m.group(1).replace(",", "")) if m else None
-
-def discount_round(price: int, rate: float = 0.10, unit: int = 100) -> int | None:
-    if price is None:
+    if not m:
         return None
-    val = Decimal(price) * Decimal(1 - rate)
-    return int((val / unit).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * unit)
+    return int(m.group(1).replace(",", ""))
 
-def safe_text(loc, fallback=""):
+def _parse_table_row(tr) -> Optional[Dict[str, Any]]:
+    tds = tr.query_selector_all("td")
+    if not tds or len(tds) < 6:
+        return None
+
+    def txt(i: int) -> str:
+        try:
+            return _clean(tds[i].inner_text())
+        except Exception:
+            return ""
+
+    # Try to find popup anchor in the last column
     try:
-        return loc.inner_text().strip()
+        # Commonly last td contains anchor for popup
+        last_td = tds[-1]
+        a = last_td.query_selector("a")
+        href = a.get_attribute("href") if a else None
     except Exception:
-        return fallback
+        href = None
 
-def find_search_input(page):
-    for sel in (
-        "form input[type='search']","form input[type='text']",
-        "input[type='search']","input[type='text']",
-        "input[placeholder*='검색']","input[placeholder*='search' i]"
-    ):
-        loc = page.locator(sel)
-        if loc.count():
-            return loc.first
-    raise RuntimeError("검색 입력창을 찾지 못했습니다.")
+    item = {
+        "cas": txt(TD_IDX["cas"]),
+        "code": txt(TD_IDX["code"]),
+        "name": txt(TD_IDX["name"]),
+        "pack": txt(TD_IDX["pack"]),
+        "popup_href": href,
+    }
+    return item
 
-# (하나만 남김) onclick/href에서 idx 추출
-def extract_idx_from_anchor(anchor):
+def _extract_idx_from_href(href: Optional[str]) -> Optional[str]:
+    if not href:
+        return None
+    m = _rx_popup_idx.search(href)
+    if not m:
+        return None
+    return m.group(1)
+
+def _route_block(route):
+    # block heavy non-essential resources
     try:
-        onclick = anchor.get_attribute("onclick") or ""
-        m = re.search(r"popup/\?idx=(\d+)", onclick)  # \d+ 로 넉넉히
-        if m:
-            return m.group(1)
-        href = anchor.get_attribute("href") or ""
-        m2 = re.search(r"popup/\?idx=(\d+)", href)
-        if m2:
-            return m2.group(1)
+        if route.request.resource_type in ("image", "media", "font"):
+            return route.abort()
     except Exception:
         pass
-    return None
+    return route.continue_()
 
-# ---- 팝업 라벨 수집 (클릭 X, idx로 직접 접속 + 디버그) ----
-def fetch_labels_by_anchor(ctx, anchor):
-    idx = extract_idx_from_anchor(anchor)  # onclick/href에서 idx 추출
-    if not idx:
-        return []
-
-    url = f"{BASE}/02_product/popup/?idx={idx}"  # ✅ /search/ 없음! 경로 교정
-    pop = ctx.new_page()
+def _collect_labels_from_popup(page, idx: str) -> List[str]:
+    url = f"{BASE}/02_product/popup/?idx={idx}"
+    page.goto(url, timeout=GOTO_TIMEOUT, wait_until="domcontentloaded")
+    # wait for container (best-effort; some popups load quickly)
     try:
-        pop.set_default_timeout(DEFAULT_TIMEOUT)
-        pop.set_default_navigation_timeout(GOTO_TIMEOUT)
+        page.wait_for_selector("div.control_wrap2", timeout=DEFAULT_TIMEOUT)
+    except PlaywrightTimeoutError:
+        pass
 
-        # 불필요 리소스 차단(이미지/폰트/미디어)
-        def _route(route):
-            if route.request.resource_type in {"image", "font", "media"}:
-                return route.abort()
-            return route.continue_()
-        pop.route("**/*", _route)
+    labels: List[str] = []
 
-        # 검색 페이지에서 온 것처럼 Referer를 명시
-        pop.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT, referer=SEARCH_URL)
+    # JS map must use '||' (not Python 'or')
+    map_js = "els => els.map(e => (e.textContent || '').trim()).filter(Boolean)"
 
-        # 규제정보 헤더가 뜨면 조금 더 대기(동적 로딩 대비)
-        try:
-            pop.wait_for_selector("text=규제정보", timeout=5000)
-        except Exception:
-            pass
+    # main document
+    try:
+        nodes = page.locator("div.control_wrap2 p.pp").element_handles()
+        if nodes:
+            labels.extend(page.evaluate(map_js, nodes))
+    except Exception:
+        pass
 
-        # 본문 추출(메인 프레임 + iframe 보조)
-        selector = "div.control_wrap2 p.pp"
-        texts = []
-
-        # main frame
-        try:
-            pop.wait_for_selector(selector, timeout=DEFAULT_TIMEOUT)
-            texts += pop.eval_on_selector_all(
-                selector, "els => els.map(e => (e.textContent or '').trim())"
-            )
-        except Exception:
-            pass
-
-        # iframes
-        for fr in pop.frames:
-            if fr == pop.main_frame:
+    # iframes (just in case some labels are inside an iframe)
+    try:
+        for f in page.frames:
+            if f is page.main_frame:
                 continue
             try:
-                fr.wait_for_selector(selector, timeout=2000)
-                texts += fr.eval_on_selector_all(
-                    selector, "els => els.map(e => (e.textContent or '').trim())"
-                )
+                nodes = f.locator("div.control_wrap2 p.pp").element_handles()
+                if nodes:
+                    labels.extend(f.evaluate(map_js, nodes))
             except Exception:
                 continue
+    except Exception:
+        pass
 
-        # 정리(중복 제거 + 공백 정규화)
-        out, seen = [], set()
-        for t in texts:
-            if not t:
-                continue
-            t = re.sub(r"\s+", " ", t).strip()
-            if t and t not in seen:
-                seen.add(t)
-                out.append(t)
+    # de-dup and clean
+    out = []
+    seen = set()
+    for s in labels:
+        s2 = (s or "").strip()
+        if not s2:
+            continue
+        if s2 in seen:
+            continue
+        seen.add(s2)
+        out.append(s2)
 
-        # 못 찾았으면 HTML 저장(원인 확인용)
-        if not out:
-            ts = int(time.time())
-            with open(f"popup_debug_{idx}_{ts}.html", "w", encoding="utf-8") as f:
-                f.write(pop.content())
-            print(f"[DEBUG] saved popup html: popup_debug_{idx}_{ts}.html")
+    return out
 
-        return out
-    except Exception as e:
-        print("[DEBUG] fetch_labels_by_anchor error:", e)
-        return []
-    finally:
-        try:
-            pop.close()
-        except Exception:
-            pass
+def search_minimal(query: str, *, first_only: bool = False, include_labels: bool = True, debug: bool = False) -> Dict[str, Any]:
+    """Run a minimal search and optionally fetch popup labels.
 
-def goto_with_retry(page, url, attempts=3):
-    last_err = None
-    for i in range(attempts):
-        try:
-            page.goto(url, wait_until="commit", timeout=GOTO_TIMEOUT)
-            page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
-            page.wait_for_selector(
-                "form input[type='search'], form input[type='text'], input[placeholder*='검색'], input[placeholder*='search' i]",
-                timeout=DEFAULT_TIMEOUT
-            )
-            return
-        except Exception as e:
-            last_err = e
-            page.wait_for_timeout(1500 * (i + 1))
-            try:
-                page.reload(timeout=GOTO_TIMEOUT)
-            except Exception:
-                pass
-    raise last_err
+    Returns:
+        {
+          "q": query,
+          "items": [ {cas, code, name, pack, labels?}, ... ],
+          "took_ms": int
+        }
+    """
+    t0 = time.time()
 
-# ---- main search ----
-def search_minimal(keyword: str, first_only: bool = True, include_labels: bool = True):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
-        ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
-            viewport={"width": 1366, "height": 900},
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9"},
-        )
-        page = ctx.new_page()
-
-        # 네트워크 상태 로거(팝업/검색만)
-        def _resp_logger(r):
-            if "/02_product/popup/?" in r.url or "/02_product/search" in r.url:
-                print("RES", r.status, r.url)
-        page.on("response", _resp_logger)
-
+        context = browser.new_context(locale="ko-KR")
+        page = context.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT)
-        page.set_default_navigation_timeout(GOTO_TIMEOUT)
 
-        # 검색 페이지 리소스 차단
-        def _route(route):
-            if route.request.resource_type in {"image", "font", "media"}:
-                return route.abort()
-            return route.continue_()
-        page.route("**/*", _route)
+        # block heavy resources
+        page.route("**/*", _route_block)
 
-        goto_with_retry(page, SEARCH_URL, attempts=3)
-
-        # 검색
-        box = find_search_input(page)
-        box.fill("")
-        box.type(keyword)
-        box.press("Enter")
-
+        # open search
+        page.goto(SEARCH_URL, timeout=GOTO_TIMEOUT, wait_until="domcontentloaded")
+        # Fill search box and submit. The site uses input name 'search_text' typically; adjust if needed
         try:
-            page.wait_for_selector("tbody tr", timeout=DEFAULT_TIMEOUT)
+            page.fill("input[name='search_text']", query)
         except Exception:
-            btns = page.locator("form button, button[type='submit'], input[type='submit']")
-            if btns.count():
-                btns.first.click()
-            page.wait_for_selector("tbody tr", timeout=DEFAULT_TIMEOUT)
+            # fallback: a common selector
+            page.fill("#search_text", query)
 
-        rows = page.locator("tbody tr")
-        n = rows.count()
-        if n == 0:
-            browser.close()
-            return []
+        # click search
+        # try several likely selectors to be robust
+        clicked = False
+        for sel in ["button[type=submit]", "#btn_search", "form[action*=search] button"]:
+            try:
+                page.click(sel)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            # as a last resort, press Enter
+            try:
+                page.press("input[name='search_text']", "Enter")
+            except Exception:
+                pass
 
-        items = []
-        for i in range(n):
-            tds = rows.nth(i).locator("td")
-            if tds.count() <= TD_IDX["stock"]:
+        # wait for results table
+        # common: table.list_table or table.board_list
+        try:
+            page.wait_for_selector("table", timeout=DEFAULT_TIMEOUT)
+        except PlaywrightTimeoutError:
+            pass
+
+        # get rows except header
+        rows = page.query_selector_all("table tr")
+        items: List[Dict[str, Any]] = []
+        for tr in rows:
+            try:
+                # skip header rows if they contain 'CAS' etc.
+                txt = (tr.inner_text() or "").strip()
+                if not txt:
+                    continue
+                if "CAS" in txt and "CODE" in txt and "NAME" in txt:
+                    continue
+
+                item = _parse_table_row(tr)
+                if not item:
+                    continue
+
+                # popup labels
+                if include_labels:
+                    idx = _extract_idx_from_href(item.get("popup_href"))
+                    if idx:
+                        try:
+                            labels = _collect_labels_from_popup(page, idx)
+                        except Exception:
+                            labels = []
+                        item["labels"] = labels
+
+                # cleanup for output
+                item.pop("popup_href", None)
+                items.append(item)
+
+                if first_only and items:
+                    break
+            except Exception:
                 continue
 
-            code = safe_text(tds.nth(TD_IDX["code"])) or None
-            price = parse_int(safe_text(tds.nth(TD_IDX["price"])))
-            stock_label = safe_text(tds.nth(TD_IDX["stock"]))
-
-            labels = []
-            if include_labels:
-                name_a = tds.nth(TD_IDX["name"]).locator("a")
-                if name_a.count():
-                    labels = fetch_labels_by_anchor(ctx, name_a.first)
-
-            items.append({
-                "brand": "대정화금",
-                "code": code,
-                "price": price,
-                "discount_price": discount_round(price, unit=100),
-                "stock_label": stock_label,
-                "labels": labels,
-            })
-
-            if first_only:
-                break
-
+        context.close()
         browser.close()
-        return items
+
+    took = int((time.time() - t0) * 1000)
+    return {"q": query, "items": items, "took_ms": took}
+
+def stop_browser():
+    """Render's FastAPI lifespan calls this; here it's a no-op because we open/close per request."""
+    pass
 
 if __name__ == "__main__":
-    kw = input("🔎 대정 제품코드 또는 키워드(하이픈 포함): ").strip()
-    data = search_minimal(kw or "4016-4400", first_only=True, include_labels=True)
-    print(json.dumps(data, ensure_ascii=False, indent=2) if data else "❌ 결과 없음")
+    # simple manual test
+    data = search_minimal("5062-8825", first_only=True, include_labels=True)
+    print(json.dumps(data, ensure_ascii=False, indent=2))
