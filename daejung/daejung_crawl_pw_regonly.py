@@ -1,148 +1,180 @@
 # -*- coding: utf-8 -*-
 """
-대정 검색 최소판 (HTTP-only, q= 고정)
-- 검색: GET /02_product/search/?q=키워드
-- 첫 행에서 code/price/stock/idx 추출
-- 팝업: GET /02_product/search/popup/?idx=XXXX 로 labels 추출
-- 출력: brand, code, price, discount_price(10%↓, 100원 반올림), stock_label, labels
+대정 최소 데이터 수집 (Playwright / 기존 정상작동 코드 기반)
+- 검색/테이블 파싱은 기존 로직 유지
+- 팝업: expect_popup 대신 idx 추출 후 직접 URL 접속
+- 라벨: div.control_wrap2 p.pp 텍스트만 수집
 """
 
-import urllib.request, urllib.parse, urllib.error
-import re, json, html as htmllib
+from playwright.sync_api import sync_playwright
 from decimal import Decimal, ROUND_HALF_UP
+import re, json, time
 
 BASE = "https://www.daejungchem.co.kr"
 SEARCH_URL = f"{BASE}/02_product/search/"
-POPUP_PREFIX = f"{BASE}/02_product/search/popup/?idx="  # 예: ...?idx=6963
+HEADLESS = True
+DEFAULT_TIMEOUT = 4000
 
-HDRS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/123.0.0.0 Safari/537.36"),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Connection": "close",
-    "Referer": SEARCH_URL,
+# --- Launch args (변경점 반영) ---
+LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+_rx_int = re.compile(r"(\d[\d,]*)")
+_rx_idx = re.compile(r"/popup/\?idx=(\d{4})|idx\s*=\s*(\d{4})", re.I)
+
+# ---- table indices (0-based) ----
+TD_IDX = {
+    "cas": 1,        # 1-based 2
+    "code": 2,       # 1-based 3
+    "name": 3,       # 1-based 4
+    "pack": 5,       # 1-based 6
+    "price": 7,      # 1-based 8
+    "stock": 8,      # 1-based 9
 }
 
-# tbody 내 첫 tr 기준으로 파싱 (0-based 인덱스)
-TD_IDX = {"cas":1, "code":2, "name":3, "pack":5, "price":7, "stock":8}
-RX_INT  = re.compile(r"(\d[\d,]*)")
-RX_IDX  = re.compile(r"/popup/\?idx=([0-9]{4})")
-KEEP_KEYS = (
-    "기존물질","유해","유해화학물질","신규화학물질",
-    "위험","규제","관계법령","산업안전보건법","화학물질","Remark"
-)
-
-def http_get(url: str, timeout=12) -> bytes | None:
-    try:
-        req = urllib.request.Request(url, headers=HDRS)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
-    except Exception:
-        return None
-
-def decode_html(raw: bytes | None) -> str:
-    if not raw:
-        return ""
-    try:
-        return raw.decode("utf-8")
-    except Exception:
-        pass
-    try:
-        return raw.decode("cp949")
-    except Exception:
-        return raw.decode("utf-8", "replace")
-
-def strip_tags(s: str) -> str:
-    s = re.sub(r"<[^>]+>", "", s)
-    s = s.replace("&nbsp;", " ").replace("\xa0", " ")
-    return htmllib.unescape(s).strip()
-
-def parse_int(s: str) -> int | None:
-    m = RX_INT.search(s or "")
+def parse_int(s: str):
+    m = _rx_int.search(s or "")
     return int(m.group(1).replace(",", "")) if m else None
 
-def discount_round(price: int | None, rate=0.10, unit=100) -> int | None:
+def discount_round(price: int, rate: float = 0.10, unit: int = 100) -> int:
     if price is None:
         return None
-    val = Decimal(price) * Decimal(1 - rate)
+    val = Decimal(price) * Decimal(1 - rate)  # 10% 할인
     return int((val / unit).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * unit)
 
-def submit_search(q: str) -> str:
-    url = SEARCH_URL + "?" + urllib.parse.urlencode({"q": q})
-    return decode_html(http_get(url))
+def safe_text(loc, fallback=""):
+    try:
+        return loc.inner_text().strip()
+    except Exception:
+        return fallback
 
-def parse_first_row(html: str) -> dict | None:
-    # 첫 tbody > tr 하나만 추출
-    m = re.search(r"<tbody[^>]*>(.*?)</tbody>", html, flags=re.S|re.I)
+def find_search_input(page):
+    for sel in (
+        "form input[type='search']","form input[type='text']",
+        "input[type='search']","input[type='text']",
+        "input[placeholder*='검색']","input[placeholder*='search' i]"
+    ):
+        loc = page.locator(sel)
+        if loc.count():
+            return loc.first
+    raise RuntimeError("검색 입력창을 찾지 못했습니다.")
+
+# --- idx 추출: //*[@id='result_list']/div[2]/form/table/tbody/tr/td[4]/a 에서 href/onclick에서 확보 ---
+def extract_idx_from_anchor(a):
+    try:
+        onclick = a.get_attribute("onclick") or ""
+        href    = a.get_attribute("href") or ""
+    except Exception:
+        onclick = ""; href = ""
+    s = f"{onclick} {href}"
+    m = _rx_idx.search(s)
     if not m:
         return None
-    tbody = m.group(1)
-    m2 = re.search(r"<tr[^>]*>(.*?)</tr>", tbody, flags=re.S|re.I)
-    if not m2:
-        return None
-    row_html = m2.group(1)
+    return (m.group(1) or m.group(2))
 
-    # 모든 td 파싱
-    tds = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.S|re.I)
-    if len(tds) <= TD_IDX["stock"]:
-        return None
+# --- 팝업 라벨 수집: 직접 URL 접속 + control_wrap2 > p.pp ---
+def fetch_labels_by_anchor(ctx, anchor):
+    idx = extract_idx_from_anchor(anchor)
+    if not idx:
+        return []  # idx가 확실히 여기 있다 하셨으니 보통 이 케이스는 없음
 
-    code = strip_tags(tds[TD_IDX["code"]]) or None
-    price = parse_int(strip_tags(tds[TD_IDX["price"]]))
-    stock_label = strip_tags(tds[TD_IDX["stock"]])
+    url = f"{BASE}/02_product/search/popup/?idx={idx}"
+    pop = ctx.new_page()
+    try:
+        pop.set_default_timeout(DEFAULT_TIMEOUT)
+        # 팝업 페이지에서 이미지/폰트는 차단 (속도)
+        def _route(route):
+            if route.request.resource_type in {"image","font","media"}:
+                return route.abort()
+            return route.continue_()
+        pop.route("**/*", _route)
 
-    # idx (팝업 링크에서 추출)
-    m_idx = RX_IDX.search(row_html)
-    idx = m_idx.group(1) if m_idx else None
+        pop.goto(url, wait_until="domcontentloaded")
+        # div.control_wrap2 내부 p.pp가 보일 때까지 조금 기다림
+        try:
+            pop.wait_for_selector("div.control_wrap2 p.pp", timeout=DEFAULT_TIMEOUT)
+        except Exception:
+            # DOM 삽입 지연 대비 한번 더
+            try:
+                pop.wait_for_load_state("networkidle", timeout=1500)
+            except Exception:
+                pass
 
-    return {
-        "brand": "대정화금",
-        "code": code,
-        "price": price,
-        "discount_price": discount_round(price, unit=100),
-        "stock_label": stock_label,
-        "idx": idx,
-    }
-
-def fetch_labels(idx: str) -> list[str]:
-    html = decode_html(http_get(POPUP_PREFIX + idx))
-    if not html:
+        pps = pop.locator("div.control_wrap2 p.pp")
+        cnt = pps.count()
+        out = []
+        for i in range(cnt):
+            t = safe_text(pps.nth(i))
+            if t and t not in out:
+                out.append(re.sub(r"\s+", " ", t))
+        return out
+    except Exception:
         return []
-    # 태그 제거 → 라인 분해
-    text = strip_tags(html)
-    lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
-    kept = [ln for ln in lines if any(k in ln for k in KEEP_KEYS)]
-    # 중복 제거
-    seen, out = set(), []
-    for ln in kept:
-        n = re.sub(r"\s+", " ", ln)
-        if n not in seen:
-            out.append(n); seen.add(n)
-    return out
+    finally:
+        try:
+            pop.close()
+        except Exception:
+            pass
 
-def search_minimal(q: str, first_only=True, include_labels=True):
-    html = submit_search(q)
-    row = parse_first_row(html)
-    if not row:
-        return []
-    labels = []
-    if include_labels and row.get("idx"):
-        labels = fetch_labels(row["idx"])
-    return [{
-        "brand": row["brand"],
-        "code": row["code"],
-        "price": row["price"],
-        "discount_price": row["discount_price"],
-        "stock_label": row["stock_label"],
-        "labels": labels,
-    }]
+def search_minimal(keyword: str):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        page.set_default_timeout(DEFAULT_TIMEOUT)
+
+        # 검색 페이지
+        page.goto(SEARCH_URL, wait_until="domcontentloaded")
+        box = find_search_input(page)
+        box.fill(""); box.type(keyword); box.press("Enter")
+
+        # 결과 대기
+        try:
+            page.wait_for_selector("tbody tr", timeout=3000)
+        except Exception:
+            btns = page.locator("form button, button[type='submit'], input[type='submit']")
+            if btns.count():
+                btns.first.click()
+            page.wait_for_selector("tbody tr", timeout=3000)
+
+        rows = page.locator("tbody tr")
+        n = rows.count()
+        if n == 0:
+            ts = int(time.time())
+            page.screenshot(path=f"daejung_debug_{ts}.png", full_page=True)
+            with open(f"daejung_debug_{ts}.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            browser.close()
+            return []
+
+        items = []
+        for i in range(n):
+            tds = rows.nth(i).locator("td")
+            if tds.count() <= TD_IDX["stock"]:
+                continue
+
+            code = safe_text(tds.nth(TD_IDX["code"])) or None
+            price = parse_int(safe_text(tds.nth(TD_IDX["price"])))
+            stock_label = safe_text(tds.nth(TD_IDX["stock"]))
+
+            # name 컬럼 a에서 idx 추출 → 직접 팝업 URL 접근
+            name_a = tds.nth(TD_IDX["name"]).locator("a")
+            labels = []
+            if name_a.count():
+                labels = fetch_labels_by_anchor(ctx, name_a.first)
+
+            items.append({
+                "brand": "대정화금",
+                "code": code,
+                "price": price,
+                "discount_price": discount_round(price, unit=100),
+                "stock_label": stock_label,
+                "labels": labels,
+            })
+
+        browser.close()
+        return items
 
 if __name__ == "__main__":
-    try:
-        kw = input("🔎 대정 제품코드/키워드: ").strip()
-    except EOFError:
-        kw = ""
-    data = search_minimal(kw or "에탄올", first_only=True, include_labels=True)
+    kw = input("🔎 대정 제품코드 또는 키워드(하이픈 포함): ").strip()
+    data = search_minimal(kw)
     print(json.dumps(data, ensure_ascii=False, indent=2) if data else "❌ 결과 없음")
