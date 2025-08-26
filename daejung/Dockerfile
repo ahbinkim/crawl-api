@@ -1,20 +1,20 @@
-# ✅ Playwright + Chromium 내장 베이스
+# Use official Playwright Python image (includes browsers & deps)
 FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
+
+ENV PYTHONDONTWRITEBYTECODE=1     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# API 의존성
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
+# System locales (optional but nice for ko-KR)
+RUN apt-get update -y && apt-get install -y --no-install-recommends locales &&     sed -i '/ko_KR.UTF-8/s/^# //g' /etc/locale.gen &&     locale-gen &&     rm -rf /var/lib/apt/lists/*
 
-# ✅ 혹시 모를 상황 대비: playwright를 다시 설치 + chromium 준비
-RUN pip install --no-cache-dir playwright==1.45.0 --root-user-action=ignore \
- && playwright install --with-deps chromium
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 앱 소스
-COPY . .
+# Ensure Chromium is installed (redundant for this base, but safe)
+RUN playwright install --with-deps chromium
 
-ENV PYTHONUNBUFFERED=1
+COPY . /app
 
-# 서버 실행
-CMD ["bash", "-lc", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+EXPOSE 10000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
