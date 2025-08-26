@@ -115,19 +115,17 @@ def fetch_labels_by_anchor(ctx, anchor):
         except Exception:
             pass
 
-def search_minimal(keyword: str):
+def search_minimal(keyword: str, first_only: bool = True, include_labels: bool = True):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
         ctx = browser.new_context()
         page = ctx.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT)
 
-        # 검색 페이지
         page.goto(SEARCH_URL, wait_until="domcontentloaded")
         box = find_search_input(page)
         box.fill(""); box.type(keyword); box.press("Enter")
 
-        # 결과 대기
         try:
             page.wait_for_selector("tbody tr", timeout=3000)
         except Exception:
@@ -139,11 +137,6 @@ def search_minimal(keyword: str):
         rows = page.locator("tbody tr")
         n = rows.count()
         if n == 0:
-            ts = int(time.time())
-            page.screenshot(path=f"daejung_debug_{ts}.png", full_page=True)
-            with open(f"daejung_debug_{ts}.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-            browser.close()
             return []
 
         items = []
@@ -156,10 +149,9 @@ def search_minimal(keyword: str):
             price = parse_int(safe_text(tds.nth(TD_IDX["price"])))
             stock_label = safe_text(tds.nth(TD_IDX["stock"]))
 
-            # name 컬럼 a에서 idx 추출 → 직접 팝업 URL 접근
-            name_a = tds.nth(TD_IDX["name"]).locator("a")
             labels = []
-            if name_a.count():
+            name_a = tds.nth(TD_IDX["name"]).locator("a")
+            if include_labels and name_a.count():
                 labels = fetch_labels_by_anchor(ctx, name_a.first)
 
             items.append({
@@ -170,6 +162,9 @@ def search_minimal(keyword: str):
                 "stock_label": stock_label,
                 "labels": labels,
             })
+
+            if first_only:
+                break
 
         browser.close()
         return items
