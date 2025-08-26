@@ -21,7 +21,6 @@ GOTO_TIMEOUT    = 30000   # 페이지 진입(ms)
 LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
 _rx_int = re.compile(r"(\d[\d,]*)")
-_rx_idx = re.compile(r"/popup/\?idx=(\d{4})|idx\s*=\s*(\d{4})", re.I)
 
 TD_IDX = {
     "cas": 1,
@@ -45,7 +44,7 @@ def parse_int(s: str):
     m = _rx_int.search(s or "")
     return int(m.group(1).replace(",", "")) if m else None
 
-def discount_round(price: int, rate: float = 0.10, unit: int = 100) -> int:
+def discount_round(price: int, rate: float = 0.10, unit: int = 100) -> int | None:
     if price is None:
         return None
     val = Decimal(price) * Decimal(1 - rate)
@@ -68,18 +67,20 @@ def find_search_input(page):
             return loc.first
     raise RuntimeError("검색 입력창을 찾지 못했습니다.")
 
-def extract_idx_from_anchor(a):
+# (하나만 남김) onclick/href에서 idx 추출
+def extract_idx_from_anchor(anchor):
     try:
-        onclick = a.get_attribute("onclick") or ""
-        href    = a.get_attribute("href") or ""
+        onclick = anchor.get_attribute("onclick") or ""
+        m = re.search(r"popup/\?idx=(\d+)", onclick)  # \d+ 로 넉넉히
+        if m:
+            return m.group(1)
+        href = anchor.get_attribute("href") or ""
+        m2 = re.search(r"popup/\?idx=(\d+)", href)
+        if m2:
+            return m2.group(1)
     except Exception:
-        onclick = ""; href = ""
-    s = f"{onclick} {href}"
-    m = _rx_idx.search(s)
-    if not m:
-        return None
-    return (m.group(1) or m.group(2))
-
+        pass
+    return None
 
 # ---- 팝업 라벨 수집 (클릭 X, idx로 직접 접속 + 디버그) ----
 def fetch_labels_by_anchor(ctx, anchor):
@@ -100,7 +101,7 @@ def fetch_labels_by_anchor(ctx, anchor):
             return route.continue_()
         pop.route("**/*", _route)
 
-        # ✅ 검색 페이지에서 온 것처럼 Referer를 명시
+        # 검색 페이지에서 온 것처럼 Referer를 명시
         pop.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT, referer=SEARCH_URL)
 
         # 규제정보 헤더가 뜨면 조금 더 대기(동적 로딩 대비)
@@ -117,7 +118,7 @@ def fetch_labels_by_anchor(ctx, anchor):
         try:
             pop.wait_for_selector(selector, timeout=DEFAULT_TIMEOUT)
             texts += pop.eval_on_selector_all(
-                selector, "els => els.map(e => (e.textContent || '').trim())"
+                selector, "els => els.map(e => (e.textContent or '').trim())"
             )
         except Exception:
             pass
@@ -129,7 +130,7 @@ def fetch_labels_by_anchor(ctx, anchor):
             try:
                 fr.wait_for_selector(selector, timeout=2000)
                 texts += fr.eval_on_selector_all(
-                    selector, "els => els.map(e => (e.textContent || '').trim())"
+                    selector, "els => els.map(e => (e.textContent or '').trim())"
                 )
             except Exception:
                 continue
@@ -144,7 +145,7 @@ def fetch_labels_by_anchor(ctx, anchor):
                 seen.add(t)
                 out.append(t)
 
-        # ✅ 못 찾았으면 HTML 저장(원인 확인용)
+        # 못 찾았으면 HTML 저장(원인 확인용)
         if not out:
             ts = int(time.time())
             with open(f"popup_debug_{idx}_{ts}.html", "w", encoding="utf-8") as f:
@@ -160,22 +161,6 @@ def fetch_labels_by_anchor(ctx, anchor):
             pop.close()
         except Exception:
             pass
-
-# (필요 시) onclick/href에서 idx를 뽑는 보조 함수
-def extract_idx_from_anchor(anchor):
-    try:
-        onclick = anchor.get_attribute("onclick") or ""
-        m = re.search(r"popup/\?idx=(\d+)", onclick)
-        if m:
-            return m.group(1)
-        href = anchor.get_attribute("href") or ""
-        m2 = re.search(r"popup/\?idx=(\d+)", href)
-        if m2:
-            return m2.group(1)
-    except Exception:
-        pass
-    return None
-
 
 def goto_with_retry(page, url, attempts=3):
     last_err = None
@@ -202,18 +187,21 @@ def search_minimal(keyword: str, first_only: bool = True, include_labels: bool =
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
         ctx = browser.new_context(
-    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
-    viewport={"width": 1366, "height": 900},
-    locale="ko-KR",
-    timezone_id="Asia/Seoul",
-    extra_http_headers={ "Accept-Language": "ko-KR,ko;q=0.9" },  # ✅ 추가
-)
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+            viewport={"width": 1366, "height": 900},
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9"},
+        )
         page = ctx.new_page()
+
+        # 네트워크 상태 로거(팝업/검색만)
         def _resp_logger(r):
             if "/02_product/popup/?" in r.url or "/02_product/search" in r.url:
                 print("RES", r.status, r.url)
         page.on("response", _resp_logger)
+
         page.set_default_timeout(DEFAULT_TIMEOUT)
         page.set_default_navigation_timeout(GOTO_TIMEOUT)
 
@@ -228,7 +216,9 @@ def search_minimal(keyword: str, first_only: bool = True, include_labels: bool =
 
         # 검색
         box = find_search_input(page)
-        box.fill(""); box.type(keyword); box.press("Enter")
+        box.fill("")
+        box.type(keyword)
+        box.press("Enter")
 
         try:
             page.wait_for_selector("tbody tr", timeout=DEFAULT_TIMEOUT)
@@ -241,6 +231,7 @@ def search_minimal(keyword: str, first_only: bool = True, include_labels: bool =
         rows = page.locator("tbody tr")
         n = rows.count()
         if n == 0:
+            browser.close()
             return []
 
         items = []
