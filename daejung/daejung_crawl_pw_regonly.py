@@ -80,31 +80,36 @@ def extract_idx_from_anchor(a):
         return None
     return (m.group(1) or m.group(2))
 
-# ---- 팝업 라벨 수집 ----
+
+# ---- 팝업 라벨 수집 (클릭 X, idx로 직접 접속 + 디버그) ----
 def fetch_labels_by_anchor(ctx, anchor):
-    idx = extract_idx_from_anchor(anchor)
+    idx = extract_idx_from_anchor(anchor)  # onclick/href에서 idx 추출
     if not idx:
         return []
 
-    url = f"{BASE}/02_product/search/popup/?idx={idx}"
+    url = f"{BASE}/02_product/popup/?idx={idx}"  # ✅ /search/ 없음! 경로 교정
     pop = ctx.new_page()
     try:
         pop.set_default_timeout(DEFAULT_TIMEOUT)
         pop.set_default_navigation_timeout(GOTO_TIMEOUT)
 
-        # 불필요 리소스 차단
+        # 불필요 리소스 차단(이미지/폰트/미디어)
         def _route(route):
-            if route.request.resource_type in {"image","font","media"}:
+            if route.request.resource_type in {"image", "font", "media"}:
                 return route.abort()
             return route.continue_()
         pop.route("**/*", _route)
 
-        pop.goto(url, wait_until="load", timeout=GOTO_TIMEOUT)
+        # ✅ 검색 페이지에서 온 것처럼 Referer를 명시
+        pop.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT, referer=SEARCH_URL)
+
+        # 규제정보 헤더가 뜨면 조금 더 대기(동적 로딩 대비)
         try:
-            pop.wait_for_load_state("networkidle", timeout=2000)
+            pop.wait_for_selector("text=규제정보", timeout=5000)
         except Exception:
             pass
 
+        # 본문 추출(메인 프레임 + iframe 보조)
         selector = "div.control_wrap2 p.pp"
         texts = []
 
@@ -117,7 +122,7 @@ def fetch_labels_by_anchor(ctx, anchor):
         except Exception:
             pass
 
-        # iframe들
+        # iframes
         for fr in pop.frames:
             if fr == pop.main_frame:
                 continue
@@ -129,7 +134,7 @@ def fetch_labels_by_anchor(ctx, anchor):
             except Exception:
                 continue
 
-        # 정리
+        # 정리(중복 제거 + 공백 정규화)
         out, seen = [], set()
         for t in texts:
             if not t:
@@ -139,14 +144,38 @@ def fetch_labels_by_anchor(ctx, anchor):
                 seen.add(t)
                 out.append(t)
 
+        # ✅ 못 찾았으면 HTML 저장(원인 확인용)
+        if not out:
+            ts = int(time.time())
+            with open(f"popup_debug_{idx}_{ts}.html", "w", encoding="utf-8") as f:
+                f.write(pop.content())
+            print(f"[DEBUG] saved popup html: popup_debug_{idx}_{ts}.html")
+
         return out
-    except Exception:
+    except Exception as e:
+        print("[DEBUG] fetch_labels_by_anchor error:", e)
         return []
     finally:
         try:
             pop.close()
         except Exception:
             pass
+
+# (필요 시) onclick/href에서 idx를 뽑는 보조 함수
+def extract_idx_from_anchor(anchor):
+    try:
+        onclick = anchor.get_attribute("onclick") or ""
+        m = re.search(r"popup/\?idx=(\d+)", onclick)
+        if m:
+            return m.group(1)
+        href = anchor.get_attribute("href") or ""
+        m2 = re.search(r"popup/\?idx=(\d+)", href)
+        if m2:
+            return m2.group(1)
+    except Exception:
+        pass
+    return None
+
 
 def goto_with_retry(page, url, attempts=3):
     last_err = None
@@ -173,13 +202,18 @@ def search_minimal(keyword: str, first_only: bool = True, include_labels: bool =
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
         ctx = browser.new_context(
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/123.0.0.0 Safari/537.36"),
-        )
+    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+    viewport={"width": 1366, "height": 900},
+    locale="ko-KR",
+    timezone_id="Asia/Seoul",
+    extra_http_headers={ "Accept-Language": "ko-KR,ko;q=0.9" },  # ✅ 추가
+)
         page = ctx.new_page()
+        def _resp_logger(r):
+            if "/02_product/popup/?" in r.url or "/02_product/search" in r.url:
+                print("RES", r.status, r.url)
+        page.on("response", _resp_logger)
         page.set_default_timeout(DEFAULT_TIMEOUT)
         page.set_default_navigation_timeout(GOTO_TIMEOUT)
 
