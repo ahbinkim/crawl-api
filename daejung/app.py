@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 from contextlib import asynccontextmanager
 from typing import Any, List, Union
-import time
+import time, glob, os
 
 # 같은 폴더에 있다고 가정
 from daejung_crawl_pw_regonly import (
@@ -68,3 +68,32 @@ def search(
     except Exception as e:
         import traceback
         return JSONResponse(status_code=500, content={"error": str(e), "trace": traceback.format_exc()})
+
+@app.get("/debug/popup", response_class=PlainTextResponse)
+def debug_popup(idx: str | None = None, latest: bool = True):
+    """
+    저장된 popup_debug_*.html 파일 내용을 확인(임시).
+    - idx를 주면 해당 idx가 들어간 최신 파일
+    - latest=True면 전체 중 가장 최신 파일
+    """
+    pattern = "popup_debug_*"
+    files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    if not files:
+        return "No debug files."
+
+    target = None
+    if idx:
+        for f in files:
+            if f"popup_debug_{idx}_" in f:
+                target = f; break
+        if not target:
+            return f"No file for idx={idx}"
+    else:
+        # 최신 파일
+        target = files[0]
+
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except Exception as e:
+        return f"ERR: {e}"
