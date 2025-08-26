@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, Query
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from contextlib import asynccontextmanager
 from typing import Any, List, Union
 import time, glob, os
 
 # 같은 폴더에 있다고 가정
 from daejung_crawl_pw_regonly import (
-    search_minimal
+    search_minimal, stop_browser, ping
 )
 
 # --- 아주 가벼운 메모리 캐시(콜드 스타트 이후 체감↑) ---
@@ -33,7 +33,7 @@ def home():
         "health": "/healthz",
         "examples": [
             "/search?q=5062-8825",
-            "/search?q=질산%20란타늄&first_only=true",
+            "/search?q=%EC%A7%88%EC%82%B0%20%EB%9E%80%ED%83%80%EB%8A%84&first_only=true",
             "/search?q=5062-8825&first_only=true&include_labels=true"
         ],
         "docs": "/docs"
@@ -69,6 +69,7 @@ def search(
         import traceback
         return JSONResponse(status_code=500, content={"error": str(e), "trace": traceback.format_exc()})
 
+# --- 디버그: 저장된 팝업 HTML 보기 (문제 해결 후 삭제 권장) ---
 @app.get("/debug/popup", response_class=PlainTextResponse)
 def debug_popup(idx: str | None = None, latest: bool = True):
     """
@@ -85,7 +86,8 @@ def debug_popup(idx: str | None = None, latest: bool = True):
     if idx:
         for f in files:
             if f"popup_debug_{idx}_" in f:
-                target = f; break
+                target = f
+                break
         if not target:
             return f"No file for idx={idx}"
     else:
