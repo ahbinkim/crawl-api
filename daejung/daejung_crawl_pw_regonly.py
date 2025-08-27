@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-대정 검색 최소 데이터 수집 (예전 코드 원본 + Render 플래그 추가)
-- 팝업을 실제 클릭(expect_popup) → body 텍스트에서 라벨 추출
-- labels 잘 나오던 버전
+대정 검색 최소 데이터 수집 (팝업-클릭 방식)
+- Render 지연 대비: 탐색 타임아웃 분리 + 재시도
 """
 from playwright.sync_api import sync_playwright
 from decimal import Decimal, ROUND_HALF_UP
@@ -11,7 +10,11 @@ import re, json, time
 BASE = "https://www.daejungchem.co.kr"
 SEARCH_URL = f"{BASE}/02_product/search/"
 HEADLESS = True
-DEFAULT_TIMEOUT = 4000
+
+# ⬇ 요소/액션 기본 대기(입력/클릭 등): 8~10초 권장
+DEFAULT_TIMEOUT = 9000
+# ⬇ 페이지 이동(네비게이션) 전용 대기: 25~30초 권장
+NAV_TIMEOUT = 30000
 
 # Render/containers: recommended browser flags
 LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
@@ -83,7 +86,7 @@ def open_popup_and_get_labels(page, anchor):
     except Exception:
         return []
     try:
-        pop.wait_for_load_state("domcontentloaded")
+        pop.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
     except Exception:
         pass
     labels = extract_regulation_lines(pop)
@@ -93,22 +96,67 @@ def open_popup_and_get_labels(page, anchor):
         pass
     return labels
 
+def _goto_with_retry(page, url, attempts=2):
+    last = None
+    for i in range(attempts):
+        try:
+            # 1차: domcontentloaded 까지 대기
+            page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            return True
+        except Exception as e:
+            last = e
+            # 2차: 더 관대한 모드(커밋 후 DOM 준비를 별도로 대기)
+            try:
+                page.goto(url, wait_until="commit", timeout=NAV_TIMEOUT)
+                page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+                return True
+            except Exception as e2:
+                last = e2
+                # 소폭 대기 후 재시도
+                try:
+                    page.wait_for_timeout(1200 * (i + 1))
+                except Exception:
+                    pass
+    # 디버그 스냅샷
+    ts = int(time.time())
+    try:
+        page.screenshot(path=f"daejung_debug_goto_{ts}.png", full_page=True)
+        with open(f"daejung_debug_goto_{ts}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+    except Exception:
+        pass
+    raise last if last else RuntimeError("goto failed")
+
 def search_minimal(keyword: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
         ctx = browser.new_context()
         page = ctx.new_page()
+        # ⬇ 두 타임아웃을 분리 설정 (중요!)
         page.set_default_timeout(DEFAULT_TIMEOUT)
+        page.set_default_navigation_timeout(NAV_TIMEOUT)
 
-        page.goto(SEARCH_URL, wait_until="domcontentloaded")
+        # 1) 검색 페이지 진입(재시도 포함)
+        _goto_with_retry(page, SEARCH_URL, attempts=2)
+
+        # 2) 검색어 입력 → 엔터
         box = find_search_input(page)
         box.fill(""); box.type(keyword); box.press("Enter")
 
+        # 3) 결과 대기 + 폴백 버튼 제출
         try:
-            page.wait_for_selector("tbody tr", timeout=3000)
+            page.wait_for_selector("tbody tr", timeout=7000)
         except Exception:
-            page.locator("form button, button[type='submit'], input[type='submit']").first.click()
-            page.wait_for_selector("tbody tr", timeout=3000)
+            try:
+                page.locator("form button, button[type='submit'], input[type='submit']").first.click()
+                page.wait_for_selector("tbody tr", timeout=7000)
+            except Exception:
+                ts = int(time.time())
+                page.screenshot(path=f"daejung_debug_{ts}.png", full_page=True)
+                with open(f"daejung_debug_{ts}.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                browser.close()
+                return []
 
         rows = page.locator("tbody tr")
         n = rows.count()
@@ -130,7 +178,7 @@ def search_minimal(keyword: str):
             price = parse_int(safe_text(tds.nth(TD_IDX["price"])))
             stock_label = safe_text(tds.nth(TD_IDX["stock"]))
 
-            # 팝업에서 규제 라벨만 추출
+            # 팝업에서 규제 라벨만 추출 (실제 클릭)
             name_a = tds.nth(TD_IDX["name"]).locator("a")
             labels = open_popup_and_get_labels(page, name_a.first) if name_a.count() else []
 
@@ -150,6 +198,7 @@ if __name__ == "__main__":
     kw = input("🔎 대정 제품코드 또는 키워드: ").strip()
     data = search_minimal(kw)
     print(json.dumps(data, ensure_ascii=False, indent=2) if data else "❌ 결과 없음")
+
 
 
 
