@@ -7,6 +7,10 @@ import json  # 추가
 
 app = Flask(__name__)
 
+@app.get("/healthz")
+def healthz():
+    return "ok"
+
 @app.route('/search', methods=['GET'])
 def search_product():
     search_keyword = request.args.get('q', '').strip()
