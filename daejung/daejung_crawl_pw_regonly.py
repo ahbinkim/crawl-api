@@ -185,7 +185,7 @@ def search_minimal(keyword: str):
             items.append({
                 "brand": "대정화금",
                 "code": code,
-                "price": price,
+                "regular_price": price,
                 "discount_price": discount_round(price, unit=100),
                 "stock_label": stock_label,
                 "labels": labels,
@@ -198,6 +198,7 @@ if __name__ == "__main__":
     kw = input("🔎 대정 제품코드 또는 키워드: ").strip()
     data = search_minimal(kw)
     print(json.dumps(data, ensure_ascii=False, indent=2) if data else "❌ 결과 없음")
+
 
 
 
