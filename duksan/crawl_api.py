@@ -42,7 +42,7 @@ def search_product():
         response_data = {
             'result': 'success',
             'product_code': search_keyword,
-            'original_price': original_price,
+            'regular_price': original_price,
             'discounted_price': discounted_price,
             'stock': {
                 'ansan': ansan_stock,
